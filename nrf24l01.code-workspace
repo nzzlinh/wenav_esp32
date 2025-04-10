@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"path": "../../../../Desktop/nrf24l01"
+		},
+		{
+			"name": "wenav_firmware",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"array": "cpp",
+			"ranges": "cpp",
+			"span": "cpp",
+			"vector": "cpp",
+			"xstring": "cpp",
+			"xutility": "cpp",
+			"string": "cpp",
+			"string_view": "cpp",
+			"ostream": "cpp",
+			"*.tcc": "cpp"
+		}
+	}
+}

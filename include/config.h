@@ -15,4 +15,6 @@
 #define CMD_NAV_UPDATE  0x01
 #define MAX_PAYLOAD     32
 
+#define USE_SPI_DMA
+
 #endif
