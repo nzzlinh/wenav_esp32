@@ -6,7 +6,11 @@ This repository contains the firmware for the WeNav navigation device, which bas
 
 TFT version
 
-![](demo/demo_tft.mp4)
+
+
+https://github.com/user-attachments/assets/4ecf75d5-f14a-4527-92cb-40b106bd6cf6
+
+
 
 OLED version
 
