@@ -1,24 +1,42 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include "Adafruit_GFX.h"        // Joey Castillo's fork
-#include "Adafruit_ST7789.h"
-#include "NimBLEDevice.h"
+#include "Adafruit_GFX.h"
 #include "config.h"
-#include "roboto.h"
-#include <U8g2_for_Adafruit_GFX.h>
-#include "esp_crc.h"  // ESP32 Hardware CRC
-#include "disconnected_icon_9.h" // Include the bitmap header file
-#include "u8g2_fonts.h" // Include the U8g2 font header file
 
-// U8g2 for Adafruit_GFX instance
+#ifdef USE_TFT_ST7789
+#include "Adafruit_ST7789.h"
+#include "U8g2_for_Adafruit_GFX.h"
 U8G2_FOR_ADAFRUIT_GFX u8g2;
+#endif
+#ifdef USE_OLED_GME128128
+  #include <U8g2lib.h>
+#endif
 
-#define LINE_SPACING_OFFSET  5
-// ST7789 TFT Display
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+#include "NimBLEDevice.h"
+#include "myfont.h"
+#include "esp_crc.h"
+#include "disconnected_icon_9.h"
+
+
+#ifdef USE_TFT_ST7789
+  Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+  #define DISPLAY_COLOR_WHITE ST77XX_WHITE
+  #define DISPLAY_COLOR_BLACK ST77XX_BLACK
+  #define DISPLAY_COLOR_GREEN ST77XX_GREEN
+  #define DISPLAY_COLOR_RED ST77XX_RED
+#endif
+#ifdef USE_OLED_GME128128
+U8G2_SH1107_SEEED_128X128_F_HW_I2C u8g2_oled(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+  #define DISPLAY_COLOR_WHITE 1
+  #define DISPLAY_COLOR_BLACK 0
+  #define DISPLAY_COLOR_GREEN 1
+  #define DISPLAY_COLOR_RED 1
+#endif
 
 extern const uint8_t u8g2_font_unifont_t_vietnamese2[15330] U8G2_FONT_SECTION("u8g2_font_unifont_t_vietnamese2");
 extern const uint8_t u8g2_font_inr33_mf[11616] U8G2_FONT_SECTION("u8g2_font_inr33_mf");
+extern const uint8_t u8g2_font_helvB18_tf[4956] U8G2_FONT_SECTION("u8g2_font_helvB18_tf");
+extern const uint8_t u8g2_font_unifont_t_vietnamese1[4308] U8G2_FONT_SECTION("u8g2_font_unifont_t_vietnamese1");
 
 // BLE Variables (unchanged)
 static NimBLEServer* pServer;
@@ -27,6 +45,11 @@ static bool deviceConnected = false;
 static bool lastConnectionStt = false;
 static bool displayNeedsUpdate = true;
 static String connectedDeviceAddress = "";
+
+// Scrolling state
+static bool isScrolling = false;
+static uint32_t scrollStartTime = 0;
+static int16_t scrollTextWidth = 0;
 
 // Data Buffer (unchanged)
 #define MAX_BUFFER_SIZE 60000
@@ -41,22 +64,13 @@ String title = "N/A";
 String eta = "N/A";
 String distance = "N/A";
 
-// Display Constants (unchanged)
-const int STATUS_BAR_HEIGHT = 36;
-const int SCREEN_WIDTH = 240;
-const int SCREEN_HEIGHT = 320;
-const int BITMAP_WIDTH = 132;
-const int BITMAP_HEIGHT = 132;
-
 // Function Prototypes
 void processReceivedData(uint8_t* data, size_t length);
 void parseData();
 void drawBitmap(int16_t x, int16_t y, uint8_t* bitmap, int16_t w, int16_t h);
 void updateDisplay();
-// Helper function to render UTF-8 strings with U8g2 fonts
-void drawUnicodeString(Adafruit_ST7789 &tft, U8G2_FOR_ADAFRUIT_GFX &u8g2, 
-  int16_t x, int16_t y, const char *text, 
-  uint16_t color, const uint8_t *font);
+void drawUnicodeString(int16_t x, int16_t y, const char *text, uint16_t color, const uint8_t *font);
+void drawBitmapScaled(U8G2 &u8g2, int x, int y, const uint8_t *bitmap, int width, int height, int scale);
 
 // BLE Callbacks (unchanged)
 class MyCharacteristicCallback : public NimBLECharacteristicCallbacks {
@@ -85,7 +99,6 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 
 // Process Received Data (unchanged)
 void processReceivedData(uint8_t* data, size_t length) {
-  // Serial.println("Received data: " + String((char*)data, length));
   for (size_t i = 0; i < length; i++) {
     dataBuffer[dataIndex++] = data[i];
     if (!receivingData && dataIndex >= 5) {
@@ -102,7 +115,6 @@ void processReceivedData(uint8_t* data, size_t length) {
         parseData();
         dataIndex = 0;
         displayNeedsUpdate = true;
-        // Serial.println("Received 1 frame");
       }
     }
     if (dataIndex >= MAX_BUFFER_SIZE) {
@@ -138,173 +150,229 @@ void parseData() {
   }
 }
 
-void drawBitmap(int16_t x, int16_t y, uint8_t* bitmap, int16_t w, int16_t h) {
-  // Define buffer for 132x132 bitmap (assuming 1-bit per pixel)
-  const int16_t DISPLAY_WIDTH = 132;
-  const int16_t DISPLAY_HEIGHT = 132;
-  const int16_t BUFFER_SIZE = (DISPLAY_WIDTH * DISPLAY_HEIGHT) / 8; // 2178 bytes
-  uint8_t renderBuffer[BUFFER_SIZE] = {0}; // Initialize buffer to all black
-  
-  // Validate input dimensions
-  if (w > DISPLAY_WIDTH || h > DISPLAY_HEIGHT) {
-      return; // Input bitmap too large
-  }
+void drawBitmapScaled(U8G2 &u8g2, int x, int y, const uint8_t *bitmap, int width, int height, int scale) {
+  if (!bitmap || scale < 1) return;
 
-  // Step 1: Parse bitmap into render buffer
-  for (int16_t j = 0; j < h; j++) {
-      for (int16_t i = 0; i < w; i++) {
-          int32_t pixelIndex = j * w + i;
-          int32_t byteIndex = pixelIndex / 8;
-          int32_t bitIndex = 7 - (pixelIndex % 8); // MSB to LSB
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      int byteIndex = row * ((width + 7) / 8) + (col / 8);
+      int bitMask = 0x80 >> (col % 8);
+      bool pixelOn = bitmap[byteIndex] & bitMask;
 
-          if (byteIndex >= bitmapSize) continue;
-
-          uint8_t byteValue = bitmap[byteIndex];
-          bool pixelValue = (byteValue >> bitIndex) & 0x01;
-
-          // Calculate position in render buffer
-          int32_t bufferPixelIndex = j * DISPLAY_WIDTH + i;
-          int32_t bufferByteIndex = bufferPixelIndex / 8;
-          int32_t bufferBitIndex = 7 - (bufferPixelIndex % 8);
-
-          if (pixelValue) {
-              renderBuffer[bufferByteIndex] |= (1 << bufferBitIndex);
-          }
+      if (pixelOn) {
+        u8g2.drawBox(x + col * scale, y + row * scale, scale, scale);
       }
-  }
-
-  // Step 2: Draw buffer to display using horizontal lines
-  for (int16_t j = 0; j < DISPLAY_HEIGHT; j++) {
-      int16_t startX = x;
-      int16_t lineStart = 0;
-      bool lastPixel = false;
-
-      for (int16_t i = 0; i < DISPLAY_WIDTH; i++) {
-          int32_t pixelIndex = j * DISPLAY_WIDTH + i;
-          int32_t byteIndex = pixelIndex / 8;
-          int32_t bitIndex = 7 - (pixelIndex % 8);
-          
-          bool currentPixel = (renderBuffer[byteIndex] >> bitIndex) & 0x01;
-
-          // If pixel changes or we're at the end, draw the previous segment
-          if (currentPixel != lastPixel || i == DISPLAY_WIDTH - 1) {
-              if (i == DISPLAY_WIDTH - 1 && currentPixel == lastPixel) {
-                  // Include the last pixel if it matches
-                  i++;
-              }
-              
-              int16_t segmentWidth = i - lineStart;
-              if (segmentWidth > 0) {
-                  uint16_t color = lastPixel ? ST77XX_WHITE : ST77XX_BLACK;
-                  tft.drawFastHLine(startX, y + j, segmentWidth, color);
-              }
-              
-              startX = x + i;
-              lineStart = i;
-              lastPixel = currentPixel;
-          }
-      }
+    }
   }
 }
 
-// Draw Unicode string with line wrapping
-void drawUnicodeString(Adafruit_ST7789 &tft, U8G2_FOR_ADAFRUIT_GFX &u8g2, 
-  int16_t x, int16_t y, const char *text, 
-  uint16_t color, const uint8_t *font) {
-    u8g2.begin(tft);              
-    u8g2.setFont(font);           
-    u8g2.setForegroundColor(color);
-    u8g2.setFontMode(1);          
+void drawBitmap(int16_t x, int16_t y, uint8_t* bitmap, int16_t w, int16_t h) {
+  if (!bitmap) {
+    Serial.println("Invalid bitmap: null pointer");
+    return;
+  }
 
-    const int16_t maxWidth = SCREEN_WIDTH - x; // Maximum width before wrapping
-    const int16_t lineHeight = u8g2.getFontAscent() - u8g2.getFontDescent(); // Approx 16 for this font
-    int16_t currentX = x;
-    int16_t currentY = y;
-    const char *p = text;
-    String currentLine = "";
-
-    while (*p) {
-        currentLine += *p;
-        int16_t textWidth = u8g2.getUTF8Width(currentLine.c_str());
-
-        // If the current line exceeds the max width, wrap it
-        if (textWidth > maxWidth && currentLine.length() > 1) {
-            // Backtrack to the last space (if any) or just wrap
-            int lastSpace = currentLine.lastIndexOf(' ');
-            if (lastSpace != -1) {
-                String lineToDraw = currentLine.substring(0, lastSpace);
-                u8g2.setCursor(currentX, currentY);
-                u8g2.print(lineToDraw.c_str());
-                currentLine = currentLine.substring(lastSpace + 1);
-            } else {
-                u8g2.setCursor(currentX, currentY);
-                u8g2.print(currentLine.c_str());
-                currentLine = "";
-            }
-            currentY += lineHeight + LINE_SPACING_OFFSET; // Move to next line
+#ifdef USE_TFT_ST7789
+  // TFT rendering (unchanged, 132x132)
+  for (int16_t j = 0; j < h; j++) {
+    int16_t startX = x;
+    int16_t lineStart = 0;
+    bool lastPixel = false;
+    for (int16_t i = 0; i < w; i++) {
+      int32_t pixelIndex = j * w + i;
+      int32_t byteIndex = pixelIndex / 8;
+      int32_t bitIndex = 7 - (pixelIndex % 8);
+      bool currentPixel = (bitmap[byteIndex] >> bitIndex) & 0x01;
+      if (currentPixel != lastPixel || i == w - 1) {
+        if (i == w - 1 && currentPixel == lastPixel) {
+          i++;
         }
-        p++;
+        int16_t segmentWidth = i - lineStart;
+        if (segmentWidth > 0) {
+          uint16_t color = lastPixel ? DISPLAY_COLOR_WHITE : DISPLAY_COLOR_BLACK;
+          tft.drawFastHLine(startX, y + j, segmentWidth, color);
+        }
+        startX = x + i;
+        lineStart = i;
+        lastPixel = currentPixel;
+      }
     }
+  }
+#endif
+#ifdef USE_OLED_GME128128
+u8g2_oled.setDrawColor(1); // Set color to white
+for (int16_t j = 0; j < h; j++) {
+  for (int16_t i = 0; i < w; i++) {
+    int32_t pixelIndex = j * w + i;
+    int32_t byteIndex = pixelIndex / 8;
+    int32_t bitIndex = 7 - (pixelIndex % 8);
+    bool pixelOn = (bitmap[byteIndex] >> bitIndex) & 0x01;
+    if (pixelOn) {
+      u8g2_oled.drawPixel(x + i, y + j);
+    }
+  }
+}
+#endif
+}
 
-    // Draw any remaining text
-    if (currentLine.length() > 0) {
+void drawUnicodeString(int16_t x, int16_t y, const char *text, uint16_t color, const uint8_t *font) {
+#ifdef USE_TFT_ST7789
+  // Unchanged TFT code
+  u8g2.begin(tft);
+  u8g2.setFont(font);
+  u8g2.setForegroundColor(color);
+  u8g2.setFontMode(1);
+  const int16_t maxWidth = SCREEN_WIDTH - x;
+  const int16_t lineHeight = u8g2.getFontAscent() - u8g2.getFontDescent();
+  int16_t currentX = x;
+  int16_t currentY = y;
+  String currentLine = "";
+
+  const char *p = text;
+  while (*p) {
+    currentLine += *p;
+    int16_t textWidth = u8g2.getUTF8Width(currentLine.c_str());
+    if (textWidth > maxWidth && currentLine.length() > 1) {
+      int lastSpace = currentLine.lastIndexOf(' ');
+      if (lastSpace != -1) {
+        String lineToDraw = currentLine.substring(0, lastSpace);
+        u8g2.setCursor(currentX, currentY);
+        u8g2.print(lineToDraw.c_str());
+        currentLine = currentLine.substring(lastSpace + 1);
+      } else {
         u8g2.setCursor(currentX, currentY);
         u8g2.print(currentLine.c_str());
+        currentLine = "";
+      }
+      currentY += lineHeight + LINE_SPACING_OFFSET;
     }
+    p++;
+  }
+  if (currentLine.length() > 0) {
+    u8g2.setCursor(currentX, currentY);
+    u8g2.print(currentLine.c_str());
+  }
+#endif
+#ifdef USE_OLED_GME128128
+  u8g2_oled.setFont(font);
+  u8g2_oled.setDrawColor(color);
+  int16_t textWidth = u8g2_oled.getUTF8Width(text);
+  const int16_t maxWidth = SCREEN_WIDTH - x; // 126 at x=2
+
+  if (textWidth <= maxWidth) {
+    // Static text
+    u8g2_oled.drawUTF8(x, y, text);
+    isScrolling = false;
+  } else {
+    // Scrolling text
+    isScrolling = true;
+    scrollTextWidth = textWidth;
+    if (scrollStartTime == 0) {
+      scrollStartTime = millis();
+    }
+    // Scroll right to left, 5s cycle
+    uint32_t elapsed = millis() - scrollStartTime;
+    // Add 500ms pause at start
+    int16_t offset;
+    if (elapsed < 500) {
+      offset = 0; // Pause
+    } else {
+      uint32_t scrollTime = elapsed - 500;
+      offset = (scrollTime % 8000) * (textWidth + SCREEN_WIDTH) / 8000;
+    }
+    int16_t drawX = SCREEN_WIDTH - offset;
+    u8g2_oled.setClipWindow(x, y - u8g2_oled.getFontAscent() - 6, x + maxWidth, y + u8g2_oled.getFontDescent()+ 6);
+    u8g2_oled.drawUTF8(drawX, y, text);
+    u8g2_oled.setClipWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT); // Reset clip
+  }
+#endif
 }
 
 void updateDisplay() {
-  // tft.fillScreen(ST77XX_BLACK);
   int yOffset = 0;
-  // Only redraw if the CRC has changed
+#ifdef USE_TFT_ST7789
   int xOffset = (SCREEN_WIDTH - BITMAP_WIDTH) / 2;
+#endif
+#ifdef USE_OLED_GME128128
+  int xOffset = 2; // Bitmap on left
+  u8g2_oled.clearBuffer();
+#endif
+
   if (deviceConnected) {
     yOffset = 0;
     // Status bar
-    tft.fillRect(0, 0, SCREEN_WIDTH, STATUS_BAR_HEIGHT, deviceConnected ? ST77XX_GREEN : ST77XX_RED);
-    drawUnicodeString(tft, u8g2, 5, 20, deviceConnected ? "Connected" : "Disconnected", 
-      ST77XX_BLACK, u8g2_font_unifont_t_vietnamese2);
-      // Navigation data
-      yOffset = STATUS_BAR_HEIGHT + 10;
-      drawBitmap(xOffset, yOffset, bitmapData, BITMAP_WIDTH, BITMAP_HEIGHT);
-      
-    yOffset = 200;
-    tft.fillRect(0, BITMAP_HEIGHT + STATUS_BAR_HEIGHT - 10 , SCREEN_WIDTH, SCREEN_HEIGHT - yOffset, ST77XX_BLACK);
-    
-    drawUnicodeString(tft, u8g2, xOffset, yOffset, (distance).c_str(), ST77XX_GREEN, u8g2_font_inr33_mf);
-    
-    yOffset += 40;
-    tft.fillRect(0, yOffset, SCREEN_WIDTH, SCREEN_HEIGHT, ST77XX_BLACK);
-    drawUnicodeString(tft, u8g2, 5, yOffset, (title).c_str(), ST77XX_WHITE, myfont);
-    yOffset = 304;
-    drawUnicodeString(tft, u8g2, 5, yOffset, (eta).c_str(), ST77XX_WHITE, myfont);
-    lastConnectionStt = deviceConnected; // Update last connection status
-  } else {
-    tft.fillScreen(ST77XX_BLACK);
-    yOffset = 0;
-    // Status bar
-    tft.fillRect(0, 0, SCREEN_WIDTH, STATUS_BAR_HEIGHT, deviceConnected ? ST77XX_GREEN : ST77XX_RED);
-    drawUnicodeString(tft, u8g2, 5, 20, deviceConnected ? "Connected" : "Disconnected", 
-                      ST77XX_WHITE, u8g2_font_unifont_t_vietnamese2);
+#ifdef USE_TFT_ST7789
+    tft.fillRect(0, 0, SCREEN_WIDTH, STATUS_BAR_HEIGHT, deviceConnected ? DISPLAY_COLOR_GREEN : DISPLAY_COLOR_RED);
+    drawUnicodeString(5, 20, deviceConnected ? "Connected" : "Disconnected", DISPLAY_COLOR_BLACK, u8g2_font_unifont_t_vietnamese2);
+#endif
 
     // Navigation data
-    yOffset = STATUS_BAR_HEIGHT + 10;
+    yOffset += 2; // y=18
+#ifdef USE_TFT_ST7789
+    drawBitmap(xOffset, yOffset, bitmapData, 132, 132);
+    yOffset = 200;
+    tft.fillRect(0, BITMAP_HEIGHT + STATUS_BAR_HEIGHT - 10, SCREEN_WIDTH, SCREEN_HEIGHT - yOffset, DISPLAY_COLOR_BLACK);
+    drawUnicodeString(xOffset, yOffset, distance.c_str(), DISPLAY_COLOR_GREEN, u8g2_font_inr33_mf);
+    yOffset += 40;
+    tft.fillRect(0, yOffset, SCREEN_WIDTH, SCREEN_HEIGHT, DISPLAY_COLOR_BLACK);
+    drawUnicodeString(5, yOffset, title.c_str(), DISPLAY_COLOR_WHITE, myfont);
+    yOffset = 304;
+    drawUnicodeString(5, yOffset, eta.c_str(), DISPLAY_COLOR_WHITE, myfont);
+#endif
+#ifdef USE_OLED_GME128128
+    drawBitmap(xOffset, yOffset, bitmapData, BITMAP_WIDTH, BITMAP_HEIGHT);
+    // ETA bound (right side of bitmap)
+    int etaX = 20; // x=74
+    int etaWidth = SCREEN_WIDTH - etaX - 2; // 52
+    int etaHeight = BITMAP_HEIGHT; // 70
+    // u8g2_oled.drawFrame(etaX, yOffset, etaWidth, etaHeight);
+    // Center ETA text
+    u8g2_oled.setFont(u8g2_font_helvB18_tf);
+    int textWidth = u8g2_oled.getUTF8Width(eta.c_str());
+    int textX = etaX + (etaWidth - textWidth) / 2;
+    int textY = yOffset + BITMAP_WIDTH + 10;
+    drawUnicodeString(textX, textY, distance.c_str(), DISPLAY_COLOR_WHITE, u8g2_font_helvB18_tf);
+    // Direction at bottom (with wrapping downward)
+    drawUnicodeString(0, 124, title.c_str(), DISPLAY_COLOR_WHITE, u8g2_font_unifont_t_vietnamese1);
+#endif
+    lastConnectionStt = deviceConnected;
+  } else {
+#ifdef USE_TFT_ST7789
+    tft.fillScreen(DISPLAY_COLOR_BLACK);
+    tft.fillRect(0, 0, SCREEN_WIDTH, STATUS_BAR_HEIGHT, deviceConnected ? DISPLAY_COLOR_GREEN : DISPLAY_COLOR_RED);
+    drawUnicodeString(5, 20, deviceConnected ? "Connected" : "Disconnected", DISPLAY_COLOR_WHITE, u8g2_font_unifont_t_vietnamese2);
     drawBitmap(54, 70, disconnected_icon_9, BITMAP_WIDTH, BITMAP_HEIGHT);
+#endif
+#ifdef USE_OLED_GME128128
+    u8g2_oled.drawBox(0, 0, SCREEN_WIDTH, STATUS_BAR_HEIGHT);
+    drawUnicodeString(5, 14, deviceConnected ? "Connected" : "Disconnected", DISPLAY_COLOR_BLACK, u8g2_font_helvB12_tf);
+    drawBitmap(19, 39, disconnected_icon_90, BITMAP_WIDTH, BITMAP_HEIGHT);
+#endif
   }
-}
 
+#ifdef USE_OLED_GME128128
+  u8g2_oled.sendBuffer();
+#endif
+}
 
 void setup() {
   Serial.begin(115200);
 
-  // Initialize TFT
+  // Initialize Display
+#ifdef USE_TFT_ST7789
   tft.init(240, 320);
-  tft.setSPISpeed(800000000);
+  tft.setSPISpeed(80000000);
   tft.setRotation(0);
-  tft.fillScreen(ST77XX_BLACK);
+  tft.fillScreen(DISPLAY_COLOR_BLACK);
+#endif
+#ifdef USE_OLED_GME128128
+  u8g2_oled.begin();
+  u8g2_oled.clearBuffer();
+  u8g2_oled.setPowerSave(0);
+#endif
 
   // BLE Setup (unchanged)
-  NimBLEDevice::init("ESP32_Navigation");
+  NimBLEDevice::init("WeNav_OLED_ESP32C3");
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
   NimBLEService* pService = pServer->createService(NimBLEUUID("18199909-f923-426c-9fdd-1e7a884d8aa2"));
@@ -320,13 +388,25 @@ void setup() {
 
   Serial.println("BLE Server started");
   updateDisplay();
+#ifdef USE_TFT_ST7789
   drawBitmap(54, 70, disconnected_icon_9, BITMAP_WIDTH, BITMAP_HEIGHT);
+#endif
+#ifdef USE_OLED_GME128128
+  drawBitmap(29, 29, disconnected_icon_9, BITMAP_WIDTH, BITMAP_HEIGHT);
+  u8g2_oled.sendBuffer();
+#endif
 }
 
 void loop() {
+  static uint32_t lastUpdate = 0;
+  uint32_t now = millis();
+  if (isScrolling && (now - lastUpdate >= 100)) { // Update every 100ms
+    displayNeedsUpdate = true;
+    lastUpdate = now;
+  }
   if (displayNeedsUpdate) {
     updateDisplay();
     displayNeedsUpdate = false;
   }
-  delay(50); // Adjust delay as needed
+  delay(10);
 }
